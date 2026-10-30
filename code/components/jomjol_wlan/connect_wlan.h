@@ -5,13 +5,16 @@
 
 #include <string>
 
-int wifi_init_sta(void);
+int wifi_init_sta(bool boundedStartup = false);
 std::string* getIPAddress();
 std::string* getSSID();
 int get_WIFI_RSSI();
 std::string* getHostname();
 
 bool getWIFIisConnected();
+// False in fallback AP / offline mode; no upstream network services may start.
+bool getNetworkServicesEnabled();
+void disableNetworkServices();
 void WIFIDestroy();
 
 #if (defined WLAN_USE_MESH_ROAMING && defined WLAN_USE_MESH_ROAMING_ACTIVATE_CLIENT_TRIGGERED_QUERIES)

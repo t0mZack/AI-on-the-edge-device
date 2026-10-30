@@ -205,7 +205,7 @@ GpioHandler::GpioHandler(std::string configFile, httpd_handle_t httpServer)
     _httpServer = httpServer;
 
     ESP_LOGI(TAG, "register GPIO Uri");
-    registerGpioUri();
+    if (_httpServer) registerGpioUri();
 }
 
 GpioHandler::~GpioHandler()  {

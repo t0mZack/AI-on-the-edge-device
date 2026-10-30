@@ -17,6 +17,9 @@
 #include "freertos/task.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"
+#include "esp_timer.h"
+#include "NetworkFallbackPolicy.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -43,6 +46,8 @@ bool isConfigINI = false;
 bool isWlanINI = false;
 
 static const char *TAG = "WIFI AP";
+static esp_netif_t *apNetif = nullptr;
+static esp_event_handler_instance_t apEventHandler = nullptr;
 
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -60,20 +65,25 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 }
 
 
-void wifi_init_softAP(void)
+esp_err_t wifi_init_softAP(void)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    esp_err_t result = esp_netif_init();
+    if (result != ESP_OK) return result;
+    // The station attempt may already have created the common event loop.
+    result = esp_event_loop_create_default();
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) return result;
+    apNetif = esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    result = esp_wifi_init(&cfg);
+    if (result != ESP_OK) return result;
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+    result = esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler,
                                                         NULL,
-                                                        NULL));
+                                                        &apEventHandler);
+    if (result != ESP_OK) return result;
 
     wifi_config_t wifi_config = { };
 
@@ -87,12 +97,72 @@ void wifi_init_softAP(void)
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    result = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (result != ESP_OK) return result;
+    result = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    if (result != ESP_OK) return result;
+    result = esp_wifi_start();
+    if (result != ESP_OK) return result;
 
     ESP_LOGI(TAG, "started with SSID \"%s\", password: \"%s\", channel: %d. Connect to AP and open http://192.168.4.1",
              EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS, EXAMPLE_ESP_WIFI_CHANNEL);
+    return ESP_OK;
+}
+
+static void stopAPRadio()
+{
+    if (apEventHandler) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, apEventHandler);
+        apEventHandler = nullptr;
+    }
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    if (apNetif) {
+        esp_netif_destroy_default_wifi(apNetif);
+        apNetif = nullptr;
+    }
+}
+
+bool StartFallbackAP()
+{
+    esp_err_t result = wifi_init_softAP();
+    if (result == ESP_OK) return true;
+    LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "Cannot start fallback AP: " + std::to_string(result));
+    stopAPRadio();
+    return false;
+}
+
+static void stopIdleAP(httpd_handle_t *server)
+{
+    if (*server) {
+        httpd_stop(*server);
+        *server = nullptr;
+    }
+    stopAPRadio();
+    LogFile.WriteToFile(ESP_LOG_INFO, TAG, "No AP client for 15 minutes; WLAN off until reset. Metering continues offline");
+}
+
+static void taskAPIdleTimer(void *parameter)
+{
+    auto *server = static_cast<httpd_handle_t *>(parameter);
+    NetworkFallback::AccessPointIdleTimer idleTimer(esp_timer_get_time());
+    for (;;) {
+        wifi_sta_list_t clients = {};
+        if (esp_wifi_ap_get_sta_list(&clients) == ESP_OK &&
+            idleTimer.expired(esp_timer_get_time(), clients.num != 0)) {
+            stopIdleAP(server);
+            vTaskDelete(nullptr);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+void StartAPIdleTimer(httpd_handle_t *server)
+{
+    if (xTaskCreate(taskAPIdleTimer, "ap_idle", 4096, server, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+        LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "Cannot create AP idle timer; disabling AP");
+        stopIdleAP(server);
+    }
 }
 
 
@@ -522,7 +592,7 @@ void CheckStartAPMode()
     {
         ESP_LOGI(TAG, "Starting access point for remote configuration");
         StatusLED(AP_OR_OTA, 2, true);
-        wifi_init_softAP();
+        ESP_ERROR_CHECK(wifi_init_softAP());
         start_webserverAP();
         while(1) { // wait until reboot within task_do_Update_ZIP
             vTaskDelay(1000 / portTICK_PERIOD_MS);

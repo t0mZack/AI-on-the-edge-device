@@ -24,7 +24,7 @@ bool getTimeIsSet(void);
 bool getTimeWasNotSetAtBoot(void);
 
 bool getUseNtp(void);
-bool setupTime();
+bool setupTime(bool allowNetwork = true);
 
 bool time_manual_reset_sync(void);
 

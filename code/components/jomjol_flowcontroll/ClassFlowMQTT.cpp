@@ -229,6 +229,7 @@ bool ClassFlowMQTT::ReadParameter(FILE* pfile, string& aktparamgraph)
 
 bool ClassFlowMQTT::Start(float AutoInterval) 
 {
+    if (!getNetworkServicesEnabled()) return false;
     roundInterval = AutoInterval; // Minutes
     keepAlive = roundInterval * 60 * 2.5; // Seconds, make sure it is greater thatn 2 rounds!
 
@@ -253,6 +254,7 @@ bool ClassFlowMQTT::Start(float AutoInterval)
 
 bool ClassFlowMQTT::doFlow(string zwtime)
 {
+    if (!getNetworkServicesEnabled()) return true;
     bool success;
     std::string result;
     std::string resulterror = "";

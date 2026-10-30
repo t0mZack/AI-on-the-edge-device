@@ -160,7 +160,7 @@ void ClassFlowWebhook::handleMeasurement(string _decsep, string _value)
 
 bool ClassFlowWebhook::doFlow(string zwtime)
 {
-    if (!WebhookEnable)
+    if (!WebhookEnable || !getNetworkServicesEnabled())
         return true;
 
     if (flowpostprocessing)

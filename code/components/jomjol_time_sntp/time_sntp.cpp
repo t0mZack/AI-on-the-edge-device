@@ -77,6 +77,7 @@ void time_sync_notification_cb(struct timeval *tv)
 
 bool time_manual_reset_sync(void)
 {
+    if (!useNtp) return false;
     sntp_restart();
 //    sntp_init();
     int retry = 0;
@@ -202,7 +203,8 @@ std::string getServerName(void) {
 /**
  * Load the TimeZone and TimeServer from the config file and initialize the NTP client
  */
-bool setupTime() {
+bool setupTime(bool allowNetwork) {
+    useNtp = allowNetwork;
     time_t now;
     struct tm timeinfo;
     char strftime_buf[64];
@@ -273,6 +275,9 @@ bool setupTime() {
     }
 
 
+    if (!allowNetwork) {
+        LogFile.WriteToFile(ESP_LOG_INFO, TAG, "AP/offline mode: NTP disabled; calendar timestamps may be unavailable");
+    }
     if (useNtp) {
         LogFile.WriteToFile(ESP_LOG_INFO, TAG, "Configuring NTP Client...");        
         esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(timeServer.c_str());

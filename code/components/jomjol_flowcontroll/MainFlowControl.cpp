@@ -1722,7 +1722,8 @@ void task_autodoFlow(void *pvParameter)
         LogFile.WriteToFile(ESP_LOG_DEBUG, TAG, "CPU Temperature: " + std::to_string((int)temperatureRead()) + "°C");
 
         // WIFI Signal Strength (RSSI) -> Logfile
-        LogFile.WriteToFile(ESP_LOG_DEBUG, TAG, "WIFI Signal (RSSI): " + std::to_string(get_WIFI_RSSI()) + "dBm");
+        if (getNetworkServicesEnabled())
+            LogFile.WriteToFile(ESP_LOG_DEBUG, TAG, "WIFI Signal (RSSI): " + std::to_string(get_WIFI_RSSI()) + "dBm");
 
         // Check if time is synchronized (if NTP is configured)
         if (getUseNtp() && !getTimeIsSet())
@@ -1732,13 +1733,13 @@ void task_autodoFlow(void *pvParameter)
         }
 
 #if (defined WLAN_USE_MESH_ROAMING && defined WLAN_USE_MESH_ROAMING_ACTIVATE_CLIENT_TRIGGERED_QUERIES)
-        wifiRoamingQuery();
+        if (getNetworkServicesEnabled()) wifiRoamingQuery();
 #endif
 
 // Scan channels and check if an AP with better RSSI is available, then disconnect and try to reconnect to AP with better RSSI
 // NOTE: Keep this direct before the following task delay, because scan is done in blocking mode and this takes ca. 1,5 - 2s.
 #ifdef WLAN_USE_ROAMING_BY_SCANNING
-        wifiRoamByScanning();
+        if (getNetworkServicesEnabled()) wifiRoamByScanning();
 #endif
 
         fr_delta_ms = (esp_timer_get_time() - fr_start) / 1000;

@@ -8,6 +8,8 @@
 #include <time.h>
 
 #include "time_sntp.h"
+#include "connect_wlan.h"
+#include "PostProcessingTimePolicy.h"
 
 #include "esp_log.h"
 
@@ -149,6 +151,10 @@ bool ClassFlowPostProcessing::SetPreValue(double _newvalue, string _numbers, boo
 }
 
 bool ClassFlowPostProcessing::LoadPreValue(void) {
+    if (!PostProcessingTimePolicy::canUsePersistedValue(getNetworkServicesEnabled(), getTimeIsSet())) {
+        LogFile.WriteToFile(ESP_LOG_WARN, TAG, "Offline without calendar time: ignoring persisted prevalues; waiting for a complete reading");
+        return false;
+    }
     std::vector<string> splitted;
     FILE* pFile;
     char zw[1024];
@@ -290,7 +296,10 @@ void ClassFlowPostProcessing::SavePreValue() {
         return;
     }
 
-    pFile = fopen(FilePreValue.c_str(), "w");
+    // Preserve the last dated prevalue on SD when offline without a clock.
+    // In-memory values/timestamps are still updated for subsequent rounds.
+    pFile = PostProcessingTimePolicy::canUsePersistedValue(getNetworkServicesEnabled(), getTimeIsSet()) ?
+            fopen(FilePreValue.c_str(), "w") : nullptr;
 
     for (int j = 0; j < NUMBERS.size(); ++j) {
         char buffer[80];
@@ -310,7 +319,7 @@ void ClassFlowPostProcessing::SavePreValue() {
 
     UpdatePreValueINI = false;
 
-    fclose(pFile);
+    if (pFile) fclose(pFile);
 }
 
 ClassFlowPostProcessing::ClassFlowPostProcessing(std::vector<ClassFlow*>* lfc, ClassFlowCNNGeneral *_analog, ClassFlowCNNGeneral *_digit) {
@@ -933,12 +942,16 @@ bool ClassFlowPostProcessing::doFlow(string zwtime) {
                 ESP_LOGD(TAG, "After AllowNegativeRates: Value %f", NUMBERS[j]->Value);
             #endif
 
-            // LastValueTimeDifference = LastValueTimeDifference / 60;       // in minutes
+            const bool rateIntervalValid = PostProcessingTimePolicy::canCalculateRate(LastPreValueTimeDifference);
             LastPreValueTimeDifference = LastPreValueTimeDifference / 60; // in minutes
-            NUMBERS[j]->FlowRateAct = (NUMBERS[j]->Value - NUMBERS[j]->PreValue) / LastPreValueTimeDifference;
-            NUMBERS[j]->ReturnRateValue =  to_string(NUMBERS[j]->FlowRateAct);
+            NUMBERS[j]->FlowRateAct = 0;
+            if (rateIntervalValid) {
+                NUMBERS[j]->FlowRateAct = (NUMBERS[j]->Value - NUMBERS[j]->PreValue) / LastPreValueTimeDifference;
+                NUMBERS[j]->ReturnRateValue = to_string(NUMBERS[j]->FlowRateAct);
+            }
 
-            if ((NUMBERS[j]->useMaxRateValue) && (NUMBERS[j]->Value != NUMBERS[j]->PreValue)) {
+            if (NUMBERS[j]->useMaxRateValue && NUMBERS[j]->Value != NUMBERS[j]->PreValue &&
+                (NUMBERS[j]->MaxRateType != RateChange || rateIntervalValid)) {
                 double _ratedifference;
 					
                 if (NUMBERS[j]->MaxRateType == RateChange) {

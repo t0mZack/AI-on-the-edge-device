@@ -74,12 +74,24 @@ int LoadWlanFromFile(std::string fn)
     while ((line.size() > 0) || !(feof(pFile)))
     {
         //ESP_LOGD(TAG, "line: %s", line.c_str());
-        if (line[0] != ';') {   // Skip lines which starts with ';'
+        if (!line.empty() && line[0] != ';') {   // Skip empty lines and comments
 
             splitted = ZerlegeZeileWLAN(line, "=");
             splitted[0] = trim(splitted[0], " ");
             
-            if ((splitted.size() > 1) && (toUpper(splitted[0]) == "SSID")){
+            if (toUpper(splitted[0]) == "FALLBACKTOAP") {
+                tmp = splitted.size() > 1 ? toUpper(trim(splitted[1])) : "";
+                if (tmp.size() >= 2 && tmp.front() == '"' && tmp.back() == '"') {
+                    tmp = tmp.substr(1, tmp.size() - 2);
+                }
+                if (tmp != "TRUE" && tmp != "FALSE") {
+                    LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "FallbackToAP must be true or false");
+                    fclose(pFile);
+                    return -1;
+                }
+                wlan_config.fallback_to_ap = tmp == "TRUE";
+            }
+            else if ((splitted.size() > 1) && (toUpper(splitted[0]) == "SSID")){
                 tmp = trim(splitted[1]);
                 if ((tmp[0] == '"') && (tmp[tmp.length()-1] == '"')){
                     tmp = tmp.substr(1, tmp.length()-2);
@@ -191,7 +203,7 @@ int LoadWlanFromFile(std::string fn)
     fclose(pFile);
 
     /* Check if SSID is empty (mandatory parameter) */
-    if (wlan_config.ssid.empty()) {
+    if (wlan_config.ssid.empty() && !wlan_config.fallback_to_ap) {
         LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "SSID empty. Device init aborted!");
         return -2;
     }

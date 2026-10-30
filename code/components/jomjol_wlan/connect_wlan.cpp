@@ -1,6 +1,7 @@
 #include "connect_wlan.h"
 
 #include <string.h>
+#include <atomic>
 #include <stdlib.h>
 #include <fstream>
 #include <vector>
@@ -14,6 +15,9 @@
 #include "driver/gpio.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"
+#include "esp_timer.h"
+#include "NetworkFallbackPolicy.h"
 #include "esp_wnm.h"
 #include "esp_rrm.h"
 #include "esp_mbo.h"
@@ -55,10 +59,20 @@
 static const char *TAG = "WIFI";
 
 static bool APWithBetterRSSI = false;
-static bool WIFIConnected = false;
+static std::atomic<bool> WIFIConnected{false};
+static std::atomic<bool> stationEnabled{false};
+static std::atomic<bool> singleStartupAttempt{false};
+static std::atomic<bool> startupFailed{false};
+static std::atomic<bool> networkServicesEnabled{true};
+static esp_event_handler_instance_t wifiEventHandler = nullptr;
+static esp_event_handler_instance_t ipEventHandler = nullptr;
+#ifdef WLAN_USE_MESH_ROAMING
+static esp_event_handler_instance_t roamingEventHandler = nullptr;
+#endif
+static bool mdnsStarted = false;
 static int WIFIReconnectCnt = 0;
 
-esp_netif_t *my_sta;
+esp_netif_t *my_sta = nullptr;
 
 
 void strinttoip4(const char *ip, int &a, int &b, int &c, int &d) {
@@ -441,6 +455,7 @@ std::string* getSSID()
 
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
+    if (!stationEnabled) return;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) 
 	{
         WIFIConnected = false;
@@ -450,6 +465,7 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
 	{
 		/* Disconnect reason: https://github.com/espressif/esp-idf/blob/d825753387c1a64463779bbd2369e177e5d59a79/components/esp_wifi/include/esp_wifi_types.h */
 		wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
+        if (singleStartupAttempt) startupFailed = true;
 		if (disconn->reason == WIFI_REASON_ROAMING) {
 			LogFile.WriteToFile(ESP_LOG_WARN, TAG, "Disconnected (" + std::to_string(disconn->reason) + ", Roaming 802.11kv)");
 			// --> no reconnect neccessary, it should automatically reconnect to new AP
@@ -477,7 +493,9 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
 				StatusLED(WLAN_CONN, 4, false);
 			}
 			WIFIReconnectCnt++;
-			esp_wifi_connect(); // Try to connect again
+            // A bounded boot performs one scan/connection attempt. Normal
+            // reconnection resumes only after that attempt obtains an IP.
+            if (!singleStartupAttempt) esp_wifi_connect();
 		}
 
 		if (WIFIReconnectCnt >= 10) {
@@ -504,6 +522,7 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
 	else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) 
 	{
         WIFIConnected = true;
+        singleStartupAttempt = false;
 		WIFIReconnectCnt = 0;
 
 		ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
@@ -520,8 +539,12 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
 }
 
 
-esp_err_t wifi_init_sta(void)
+esp_err_t wifi_init_sta(bool boundedStartup)
 {
+    const int64_t startUs = esp_timer_get_time();
+    singleStartupAttempt = boundedStartup;
+    startupFailed = false;
+    stationEnabled = true;
 	esp_err_t retval = esp_netif_init();
 	if (retval != ESP_OK) {
 		LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "esp_netif_init: Error: "  + std::to_string(retval));
@@ -589,14 +612,14 @@ esp_err_t wifi_init_sta(void)
 	}
 
     retval = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                        &event_handler, NULL, NULL);
+                                                        &event_handler, NULL, &wifiEventHandler);
 	if (retval != ESP_OK) {
 		LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "esp_event_handler_instance_register - WIFI_ANY: Error: "  + std::to_string(retval));
 		return retval;
 	}
 
     retval = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                        &event_handler, NULL, NULL);
+                                                        &event_handler, NULL, &ipEventHandler);
 	if (retval != ESP_OK) {
 		LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "esp_event_handler_instance_register - GOT_IP: Error: "  + std::to_string(retval));
 		return retval;
@@ -604,7 +627,7 @@ esp_err_t wifi_init_sta(void)
 
 	#ifdef WLAN_USE_MESH_ROAMING
 	retval = esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_BSS_RSSI_LOW,
-                                                        &esp_bss_rssi_low_handler, NULL, NULL);
+                                                        &esp_bss_rssi_low_handler, NULL, &roamingEventHandler);
 	if (retval != ESP_OK) {
 		LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "esp_event_handler_instance_register - BSS_RSSI_LOW: Error: "  + std::to_string(retval));
 		return retval;
@@ -670,6 +693,21 @@ esp_err_t wifi_init_sta(void)
 	    }
     }
 
+    mdnsStarted = retval == ESP_OK && !wlan_config.hostname.empty();
+    if (boundedStartup) {
+        while (!WIFIConnected) {
+            if (startupFailed) {
+                LogFile.WriteToFile(ESP_LOG_WARN, TAG, "Single WLAN connection attempt failed; entering fallback mode");
+                return ESP_FAIL;
+            }
+            if (NetworkFallback::connectionTimedOut(startUs, esp_timer_get_time())) {
+                LogFile.WriteToFile(ESP_LOG_WARN, TAG, "No WLAN IP within 15 seconds; entering fallback mode");
+                return ESP_ERR_TIMEOUT;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
     LogFile.WriteToFile(ESP_LOG_INFO, TAG, "Init successful");
 	return ESP_OK;
 }
@@ -704,17 +742,45 @@ bool getWIFIisConnected()
     return WIFIConnected;
 }
 
+bool getNetworkServicesEnabled()
+{
+    return networkServicesEnabled;
+}
+
+void disableNetworkServices()
+{
+    networkServicesEnabled = false;
+}
 
 void WIFIDestroy() 
 {	
-	esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, event_handler);
-    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, event_handler);
+    stationEnabled = false; // Stop reconnects before stopping the driver.
+    WIFIConnected = false;
+    if (ipEventHandler) {
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ipEventHandler);
+        ipEventHandler = nullptr;
+    }
+    if (wifiEventHandler) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifiEventHandler);
+        wifiEventHandler = nullptr;
+    }
 	#ifdef WLAN_USE_MESH_ROAMING
-	esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_BSS_RSSI_LOW, esp_bss_rssi_low_handler);
+    if (roamingEventHandler) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_STA_BSS_RSSI_LOW, roamingEventHandler);
+        roamingEventHandler = nullptr;
+    }
 	#endif
 
+    if (mdnsStarted) {
+        mdns_free();
+        mdnsStarted = false;
+    }
 	esp_wifi_disconnect();
 	esp_wifi_stop();
 	esp_wifi_deinit();
+    if (my_sta) {
+        esp_netif_destroy_default_wifi(my_sta);
+        my_sta = nullptr;
+    }
 }
 

@@ -9,6 +9,7 @@
 #include "psram.h"
 
 #include "esp_chip_info.h"
+#include "esp_wifi.h"
 
 #include "esp_vfs_fat.h"
 #include "ffconf.h"
@@ -387,10 +388,6 @@ extern "C" void app_main(void)
     // ********************************************
     migrateConfiguration();
 
-    // Init time (as early as possible, but SD card needs to be initialized)
-    // ********************************************
-    setupTime(); // NTP time service: Status of time synchronization will be checked after every round (server_tflite.cpp)
-
     // Set CPU Frequency
     // ********************************************
     setCpuFrequency();
@@ -458,14 +455,34 @@ extern "C" void app_main(void)
     // Read WLAN parameter and start WIFI
     // ********************************************
     int iWLANStatus = LoadWlanFromFile(WLAN_CONFIG_FILE);
+    bool fallbackAP = false;
+#ifndef ENABLE_SOFTAP
+    if (wlan_config.fallback_to_ap) {
+        LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "FallbackToAP requires a build with ENABLE_SOFTAP");
+        return;
+    }
+#endif
     if (iWLANStatus == 0)
     {
         LogFile.WriteToFile(ESP_LOG_INFO, TAG, "WLAN config loaded, init WIFI...");
-        if (wifi_init_sta() != ESP_OK)
+        // An empty SSID is permitted only when fallback was explicitly enabled.
+        int wifiStatus = wlan_config.ssid.empty() ? ESP_ERR_WIFI_SSID :
+                         wifi_init_sta(wlan_config.fallback_to_ap);
+        if (wifiStatus != ESP_OK)
         {
-            LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "WIFI init failed. Device init aborted!");
-            StatusLED(WLAN_INIT, 3, true);
-            return;
+            if (!wlan_config.fallback_to_ap) {
+                LogFile.WriteToFile(ESP_LOG_ERROR, TAG, "WIFI init failed. Device init aborted!");
+                StatusLED(WLAN_INIT, 3, true);
+                return;
+            }
+            disableNetworkServices();
+            WIFIDestroy();
+#ifdef ENABLE_SOFTAP
+            fallbackAP = StartFallbackAP();
+#endif
+            LogFile.WriteToFile(ESP_LOG_INFO, TAG, fallbackAP ?
+                "Fallback AP active: full Web UI at http://192.168.4.1; metering runs without network services" :
+                "Fallback AP failed; continuing metering offline");
         }
 
         init_basic_auth();
@@ -481,13 +498,16 @@ extern "C" void app_main(void)
         return; // No way to continue with empty SSID or password!
     }
 
+    // Decide the network mode before creating the NTP client.
+    setupTime(getNetworkServicesEnabled());
+
     xDelay = 2000 / portTICK_PERIOD_MS;
     ESP_LOGD(TAG, "main: sleep for: %ldms", (long)xDelay * CONFIG_FREERTOS_HZ / portTICK_PERIOD_MS);
     vTaskDelay(xDelay);
 
     // manual reset the time
     // ********************************************
-    if (!time_manual_reset_sync())
+    if (getUseNtp() && !time_manual_reset_sync())
     {
         LogFile.WriteToFile(ESP_LOG_DEBUG, TAG, "Manual Time Sync failed during startup");
     }
@@ -534,19 +554,27 @@ extern "C" void app_main(void)
     // ********************************************
     ESP_LOGD(TAG, "starting servers");
 
-    server = start_webserver();
-    register_server_camera_uri(server);
-    register_server_main_flow_task_uri(server);
-    register_server_file_uri(server, "/sdcard");
-    register_server_ota_sdcard_uri(server);
+    server = getNetworkServicesEnabled() || fallbackAP ? start_webserver() : nullptr;
+    if (server) {
+        register_server_camera_uri(server);
+        register_server_main_flow_task_uri(server);
+        register_server_file_uri(server, "/sdcard");
+        register_server_ota_sdcard_uri(server);
 #ifdef ENABLE_MQTT
-    register_server_mqtt_uri(server);
+        register_server_mqtt_uri(server);
 #endif // ENABLE_MQTT
 
-    gpio_handler_create(server);
+        gpio_handler_create(server);
 
-    ESP_LOGD(TAG, "Before reg server main");
-    register_server_main_uri(server, "/sdcard");
+        ESP_LOGD(TAG, "Before reg server main");
+        register_server_main_uri(server, "/sdcard");
+    } else {
+        // GPIO measurement / flashlight handling also works without HTTP.
+        gpio_handler_create(nullptr);
+    }
+#ifdef ENABLE_SOFTAP
+    if (fallbackAP) StartAPIdleTimer(&server);
+#endif
 
     // Only for testing purpose
     // setSystemStatusFlag(SYSTEM_STATUS_CAM_FB_BAD);

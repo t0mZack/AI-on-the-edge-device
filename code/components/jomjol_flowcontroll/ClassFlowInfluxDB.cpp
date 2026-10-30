@@ -133,7 +133,7 @@ bool ClassFlowInfluxDB::ReadParameter(FILE* pfile, string& aktparamgraph)
 
 bool ClassFlowInfluxDB::doFlow(string zwtime)
 {
-    if (!InfluxDBenable)
+    if (!InfluxDBenable || !getNetworkServicesEnabled())
         return true;
 
     std::string result;

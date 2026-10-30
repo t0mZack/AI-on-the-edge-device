@@ -17,6 +17,8 @@
 #include <esp_http_server.h>
 
 void CheckStartAPMode();
+bool StartFallbackAP();
+void StartAPIdleTimer(httpd_handle_t *server);
 
 #endif  //SOFTAP_H
 

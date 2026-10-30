@@ -194,7 +194,7 @@ void ClassFlowInfluxDBv2::handleMeasurement(string _decsep, string _value)
 
 bool ClassFlowInfluxDBv2::doFlow(string zwtime)
 {
-    if (!InfluxDBenable)
+    if (!InfluxDBenable || !getNetworkServicesEnabled())
         return true;
 
     std::string measurement;
